@@ -1,5 +1,6 @@
 import gc
 import logging
+import os
 from dataclasses import replace
 
 import torch
@@ -31,6 +32,7 @@ from ltx_pipelines.utils.types import (
     DenoisingLoopFunc,
     PipelineComponents,
 )
+from ltx_pipelines.utils.telemetry import log_cuda_memory, log_nvidia_smi, log_ram_memory, reset_cuda_peak_memory_stats
 
 
 def get_device() -> torch.device:
@@ -41,8 +43,30 @@ def get_device() -> torch.device:
 
 def cleanup_memory() -> None:
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def try_offload_to_cpu(module: object) -> None:
+    """
+    Best-effort VRAM release for large modules after use.
+
+    Some quantized backends (e.g. bitsandbytes 4-bit) may not support .to("cpu");
+    in those cases we rely on deleting references + empty_cache().
+    """
+    # Default offload behavior is "delete + empty_cache()" elsewhere. Copying large models
+    # from GPU back to CPU can take a long time and spike RAM usage, so keep it opt-in.
+    if (os.environ.get("LTX_OFFLOAD_TEXT_ENCODER_TO_CPU", "") or "").strip() not in ("1", "true", "TRUE", "yes"):
+        return
+    if module is None:
+        return
+    try:
+        to_fn = getattr(module, "to", None)
+        if callable(to_fn):
+            to_fn(torch.device("cpu"))
+    except Exception:
+        pass
 
 
 def image_conditionings_by_replacing_latent(
@@ -136,7 +160,15 @@ def euler_denoising_loop(
         A pair ``(video_state, audio_state)`` containing the final video and
         audio latent states after completing the denoising loop.
     """
+    mem_every = int(os.environ.get("LTX_LOG_MEM_EVERY", "0") or "0")
+    if torch.cuda.is_available():
+        reset_cuda_peak_memory_stats()
+
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+        if mem_every > 0 and (step_idx % mem_every == 0):
+            log_ram_memory(f"denoise step={step_idx}")
+            log_cuda_memory(f"denoise step={step_idx}")
+            log_nvidia_smi(f"denoise step={step_idx}")
         denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_idx)
 
         denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)

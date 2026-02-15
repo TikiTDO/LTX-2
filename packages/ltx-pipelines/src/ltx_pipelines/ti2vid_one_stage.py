@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Iterator
+from dataclasses import replace
 
 import torch
 
@@ -10,6 +11,7 @@ from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import encode_text
@@ -17,9 +19,11 @@ from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.args import default_1_stage_arg_parser
 from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
+from ltx_pipelines.utils.device_map import resolve_transformer_device_map_preset
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
     cleanup_memory,
+    try_offload_to_cpu,
     denoise_audio_video,
     euler_denoising_loop,
     generate_enhanced_prompt,
@@ -28,6 +32,8 @@ from ltx_pipelines.utils.helpers import (
     multi_modal_guider_denoising_func,
 )
 from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.telemetry import Timer, log_cuda_memory, log_nvidia_smi, log_ram_memory, log_system_summary
+from ltx_pipelines.utils.text_context import TextContexts, load_text_contexts, save_text_contexts
 from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
@@ -44,10 +50,17 @@ class TI2VidOneStagePipeline:
     def __init__(
         self,
         checkpoint_path: str,
-        gemma_root: str,
+        gemma_root: str | None,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device = device,
         quantization: QuantizationPolicy | None = None,
+        transformer_device_map: dict[str, str] | None = None,
+        transformer_offload_dir: str | None = None,
+        text_encoder_backend: str = "gemma-hf",
+        gemma_device_map: str = "",
+        gemma_move_vision_tower_to: str = "",
+        temporal_upsampler_path: str | None = None,
+        temporal_upsample: bool = False,
     ):
         self.dtype = torch.bfloat16
         self.device = device
@@ -58,12 +71,20 @@ class TI2VidOneStagePipeline:
             gemma_root_path=gemma_root,
             loras=loras,
             quantization=quantization,
+            transformer_device_map=transformer_device_map,
+            transformer_offload_dir=transformer_offload_dir,
+            text_encoder_backend=text_encoder_backend,
+            gemma_device_map=gemma_device_map,
+            gemma_move_vision_tower_to=gemma_move_vision_tower_to,
+            temporal_upsampler_path=temporal_upsampler_path,
         )
         self.pipeline_components = PipelineComponents(
             dtype=self.dtype,
             device=device,
         )
+        self.temporal_upsample = bool(temporal_upsample)
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,
@@ -78,30 +99,74 @@ class TI2VidOneStagePipeline:
         audio_guider_params: MultiModalGuiderParams,
         images: list[tuple[str, int, float]],
         enhance_prompt: bool = False,
+        context_in_path: str | None = None,
+        context_out_path: str | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=False)
+        log_cuda_memory("one_stage:begin")
+        log_ram_memory("one_stage:begin")
+        log_nvidia_smi("one_stage:begin")
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        text_encoder = self.model_ledger.text_encoder()
-        if enhance_prompt:
-            prompt = generate_enhanced_prompt(
-                text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
+        if context_in_path is not None:
+            if enhance_prompt:
+                raise ValueError("enhance_prompt requires a live text encoder (disable it when using context_in_path)")
+            t = Timer("text_contexts_load")
+            contexts = load_text_contexts(context_in_path, device=self.device)
+            v_context_p, a_context_p, v_context_n, a_context_n = (
+                contexts.v_context_p,
+                contexts.a_context_p,
+                contexts.v_context_n,
+                contexts.a_context_n,
             )
-        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-        v_context_p, a_context_p = context_p
-        v_context_n, a_context_n = context_n
+            t.done()
+        else:
+            t = Timer("text_encoder_load+encode")
+            text_encoder = self.model_ledger.text_encoder()
+            if enhance_prompt:
+                prompt = generate_enhanced_prompt(
+                    text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
+                )
+            context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
+            v_context_p, a_context_p = context_p
+            v_context_n, a_context_n = context_n
+            # If the text encoder is CPU-backed (e.g. gemma-hf-cpu), move contexts to the pipeline device.
+            v_context_p = v_context_p.to(self.device)
+            a_context_p = a_context_p.to(self.device)
+            v_context_n = v_context_n.to(self.device)
+            a_context_n = a_context_n.to(self.device)
+            t.done()
 
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
+            if context_out_path is not None:
+                save_text_contexts(
+                    context_out_path,
+                    TextContexts(
+                        v_context_p=v_context_p,
+                        a_context_p=a_context_p,
+                        v_context_n=v_context_n,
+                        a_context_n=a_context_n,
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                    ),
+                )
+
+            # Offload text encoder ASAP to free VRAM before loading the diffusion transformer.
+            try_offload_to_cpu(text_encoder)
+            del text_encoder
+            cleanup_memory()
 
         # Stage 1: Initial low resolution video generation.
+        t = Timer("stage1_models_load")
         video_encoder = self.model_ledger.video_encoder()
         transformer = self.model_ledger.transformer()
+        t.done()
+        log_cuda_memory("one_stage:after_models_load")
+        log_ram_memory("one_stage:after_models_load")
+        log_nvidia_smi("one_stage:after_models_load")
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
 
         def first_stage_denoising_loop(
@@ -152,26 +217,44 @@ class TI2VidOneStagePipeline:
         torch.cuda.synchronize()
         del transformer
         cleanup_memory()
+        log_cuda_memory("one_stage:after_denoise")
+        log_ram_memory("one_stage:after_denoise")
+        log_nvidia_smi("one_stage:after_denoise")
 
+        t = Timer("decode_video+audio")
+        if self.temporal_upsample:
+            # Interpolate in latent space. Frames become (2F - 1).
+            video_state = replace(video_state, latent=upsample_video(video_state.latent[:1], video_encoder, self.model_ledger.temporal_upsampler()))
         decoded_video = vae_decode_video(video_state.latent, self.model_ledger.video_decoder(), generator=generator)
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.model_ledger.audio_decoder(), self.model_ledger.vocoder()
         )
+        t.done()
 
         return decoded_video, decoded_audio
 
 
 @torch.inference_mode()
 def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    log_system_summary("ti2vid_one_stage")
     parser = default_1_stage_arg_parser()
     args = parser.parse_args()
+    transformer_device_map = resolve_transformer_device_map_preset(args.transformer_device_map) if args.dispatch_transformer else None
+    transformer_offload_dir = args.transformer_offload_dir or None
+    if not args.gemma_root:
+        raise ValueError("--gemma-root is required for --text-encoder gemma-hf/gemma-bnb4")
+    gemma_root = args.gemma_root or None
     pipeline = TI2VidOneStagePipeline(
         checkpoint_path=args.checkpoint_path,
-        gemma_root=args.gemma_root,
+        gemma_root=gemma_root,
         loras=args.lora,
         quantization=args.quantization,
+        transformer_device_map=dict(transformer_device_map) if transformer_device_map is not None else None,
+        transformer_offload_dir=transformer_offload_dir,
+        text_encoder_backend=args.text_encoder,
     )
+
     video, audio = pipeline(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
@@ -198,6 +281,7 @@ def main() -> None:
             stg_blocks=args.audio_stg_blocks,
         ),
         images=args.images,
+        enhance_prompt=args.enhance_prompt,
     )
 
     encode_video(

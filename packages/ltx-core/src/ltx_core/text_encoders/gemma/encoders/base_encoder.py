@@ -68,9 +68,11 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
         attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        projected = self._run_feature_extractor(
-            hidden_states=outputs.hidden_states, attention_mask=attention_mask, padding_side=padding_side
-        )
+        # In sharded (multi-GPU) setups, hidden states can be produced on different devices.
+        # Coalesce them onto the feature extractor's device before stacking.
+        fe_dev = next(self.feature_extractor_linear.parameters()).device
+        hidden_states = [hs.to(device=fe_dev, non_blocking=True) for hs in outputs.hidden_states]
+        projected = self._run_feature_extractor(hidden_states=hidden_states, attention_mask=attention_mask, padding_side=padding_side)
         return projected, attention_mask
 
     def _enhance(
@@ -82,11 +84,21 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
     ) -> str:
         text = self.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-        model_inputs = self.processor(
-            text=text,
-            images=image,
-            return_tensors="pt",
-        ).to(self.model.device)
+        # Keep inputs on the same device as token embedding weights.
+        # In sharded setups, `self.model.device` can be unstable if some submodules remain on CPU.
+        try:
+            target_device = self.model.model.language_model.embed_tokens.weight.device
+        except Exception:
+            target_device = self.model.device
+
+        # For image-conditioned prompts, do NOT apply tokenizer truncation here: it can break the
+        # special multimodal token alignment (Gemma3 expects a fixed number of image tokens).
+        # If you hit OOM or extremely long prompts, shorten the prompt before calling enhance_i2v.
+        processor_kwargs = {"text": text, "images": image, "return_tensors": "pt"}
+        if image is None:
+            processor_kwargs.update({"truncation": True, "max_length": 1024})
+
+        model_inputs = self.processor(**processor_kwargs).to(target_device)
         pad_token_id = self.processor.tokenizer.pad_token_id if self.processor.tokenizer.pad_token_id is not None else 0
         model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
 

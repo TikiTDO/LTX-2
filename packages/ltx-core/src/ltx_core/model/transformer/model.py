@@ -2,6 +2,8 @@ from enum import Enum
 
 import torch
 
+from dataclasses import replace
+
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
@@ -15,6 +17,35 @@ from ltx_core.model.transformer.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from ltx_core.utils import to_denoised
+
+
+def _move_transformer_args(args: TransformerArgs | None, device: torch.device) -> TransformerArgs | None:
+    if args is None:
+        return None
+
+    def _to_device(value):  # noqa: ANN001
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, tuple):
+            return tuple(v.to(device) if isinstance(v, torch.Tensor) else v for v in value)
+        if isinstance(value, list):
+            return [v.to(device) if isinstance(v, torch.Tensor) else v for v in value]
+        return value
+
+    return replace(
+        args,
+        x=_to_device(args.x),
+        context=_to_device(args.context),
+        context_mask=_to_device(args.context_mask),
+        timesteps=_to_device(args.timesteps),
+        embedded_timestep=_to_device(args.embedded_timestep),
+        positional_embeddings=_to_device(args.positional_embeddings),
+        cross_positional_embeddings=_to_device(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=_to_device(args.cross_scale_shift_timestep),
+        cross_gate_timestep=_to_device(args.cross_gate_timestep),
+    )
 
 
 class LTXModelType(Enum):
@@ -333,6 +364,11 @@ class LTXModel(torch.nn.Module):
 
         # Process transformer blocks
         for block in self.transformer_blocks:
+            # Support manual model sharding: move args to the block's device before executing it.
+            # (Accelerate-style hooks are not used in this repo's model implementation.)
+            block_device = next(block.parameters()).device
+            video = _move_transformer_args(video, block_device)
+            audio = _move_transformer_args(audio, block_device)
             if self._enable_gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory during training.
                 # With use_reentrant=False, we can pass dataclasses directly -
@@ -394,6 +430,12 @@ class LTXModel(torch.nn.Module):
             audio=audio_args,
             perturbations=perturbations,
         )
+
+        # Output heads live on the root module device; move final activations back before projecting.
+        if video_out is not None:
+            video_out = _move_transformer_args(video_out, self.proj_out.weight.device)
+        if audio_out is not None:
+            audio_out = _move_transformer_args(audio_out, self.audio_proj_out.weight.device)
 
         # Process output
         vx = (

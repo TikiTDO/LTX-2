@@ -124,8 +124,24 @@ def basic_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gemma-root",
         type=resolve_path,
-        required=True,
-        help="Path to the root directory containing the Gemma text encoder model files.",
+        required=False,
+        default="",
+        help=(
+            "Path to the root directory containing the Gemma text encoder model files. "
+            "Required for --text-encoder gemma-hf/gemma-bnb4."
+        ),
+    )
+    parser.add_argument(
+        "--text-encoder",
+        type=str,
+        choices=("gemma-hf", "gemma-hf-cpu", "gemma-bnb4"),
+        default="gemma-hf",
+        help=(
+            "Text encoder backend. "
+            "'gemma-hf' uses the repository's HuggingFace Gemma 3 implementation (requires --gemma-root). "
+            "'gemma-hf-cpu' is the same as gemma-hf, but keeps the text encoder on CPU (avoids GPU OOM). "
+            "'gemma-bnb4' loads Gemma via bitsandbytes 4-bit quantization from --gemma-root (requires bitsandbytes). "
+        ),
     )
     parser.add_argument(
         "--prompt",
@@ -212,6 +228,36 @@ def basic_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--enhance-prompt", action="store_true")
     parser.add_argument(
+        "--dispatch-transformer",
+        action="store_true",
+        help=(
+            "Use Accelerate to dispatch the diffusion transformer across multiple devices. "
+            "This enables multi-GPU sharding / CPU offload. "
+            "When enabled, use --transformer-device-map and optional --transformer-offload-dir."
+        ),
+    )
+    parser.add_argument(
+        "--transformer-device-map",
+        type=str,
+        default="",
+        help=(
+            "Transformer device map preset. Supported: "
+            "'split-2gpu' (even split of transformer blocks across cuda:0/1), "
+            "'interleave-2gpu' (even/odd blocks across cuda:0/1), "
+            "'split-2gpu+cpu' (split across cuda:0/1 with final third on CPU RAM). "
+            "Empty means 'no preset'. For custom mapping, extend ltx_pipelines.utils.device_map."
+        ),
+    )
+    parser.add_argument(
+        "--transformer-offload-dir",
+        type=resolve_path,
+        default="",
+        help=(
+            "Optional directory for Accelerate offload buffers when using --dispatch-transformer. "
+            "Use a fast disk with plenty of space (e.g. /home/tiki/store/... on airia)."
+        ),
+    )
+    parser.add_argument(
         "--quantization",
         dest="quantization",
         action=QuantizationAction,
@@ -295,7 +341,7 @@ def default_1_stage_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_VIDEO_GUIDER_PARAMS.skip_step,
         help=(
             "Video skip step N controls periodic skipping during the video diffusion process: "
-            "only steps where step_index % (N + 1) == 0 are processed, all others are skipped "
+            "only steps where step_index modulo (N + 1) == 0 are processed, all others are skipped "
             f"(e.g., 0 = no skipping; 1 = skip every other step; 2 = skip 2 of every 3 steps; "
             f"default: {DEFAULT_VIDEO_GUIDER_PARAMS.skip_step})."
         ),
@@ -355,7 +401,7 @@ def default_1_stage_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_AUDIO_GUIDER_PARAMS.skip_step,
         help=(
             "Audio skip step N controls periodic skipping during the audio diffusion process: "
-            "only steps where step_index % (N + 1) == 0 are processed, all others are skipped "
+            "only steps where step_index modulo (N + 1) == 0 are processed, all others are skipped "
             f"(e.g., 0 = no skipping; 1 = skip every other step; 2 = skip 2 of every 3 steps; "
             f"default: {DEFAULT_AUDIO_GUIDER_PARAMS.skip_step})."
         ),

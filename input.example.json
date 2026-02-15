@@ -1,0 +1,29 @@
+{
+  "pipeline": "ti2vid_two_stages",
+  "checkpoint_path": "ltx-2-19b-dev-fp8.safetensors",
+  "spatial_upsampler_path": "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+  "temporal_upsampler_path": "ltx-2-temporal-upscaler-x2-1.0.safetensors",
+  "temporal_upsample": false,
+  "loras": [
+    { "path": "models/ltx-2-19b-lora-camera-control-static.safetensors", "strength": 1.0 }
+  ],
+  "text_encoder": "gemma-hf",
+  "gemma_root": "models/gemma-3-12b-it-qat-q4_0-unquantized",
+  "prompt": "The camera opens in a calm, sunlit frog yoga studio. Warm morning light washes over the wooden floor as incense smoke drifts lazily in the air. The senior frog instructor sits cross-legged at the center, eyes closed, voice deep and calm. “We are one with the pond.” All the frogs answer softly: “Ommm…” “We are one with the mud.” “Ommm…” He smiles faintly. “We are one with the flies.” A pause. The camera pans to the side towards one frog who twitches, eyes darting. The master exhales slowly, still serene. “But we do not chase the flies…” Beat. “not during class.” The guilty frog lowers its head in shame, folding its hands back into a meditative pose. The other frogs resume their chant: “Ommm…”.",
+  "negative_prompt": "",
+  "images": [
+    { "path": "image/frog.jpg", "frame_idx": 0, "strength": 1 }
+  ],
+  "height": 512,
+  "width": 768,
+  "num_frames": 120,
+  "frame_rate": 24,
+  "num_inference_steps": 8,
+  "seed": 10,
+  "enhance_prompt": true,
+  "gemma_device_map": "middle-2gpu@8:40",
+  "dispatch_transformer": "auto",
+  "transformer_device_map": "split-2gpu",
+  "transformer_offload_dir": "/home/tiki/store/ltx-offload",
+  "output_path": "output/frog_yoga_768x512_120f_24fps_enhanced_2stage.mp4"
+}

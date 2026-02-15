@@ -39,3 +39,11 @@ tmp
 *.png
 *.wav
 *.webp
+
+# Custom
+models
+venv
+output
+!input.example.json
+!output/.keep
+!image/frong.jpg

@@ -76,10 +76,16 @@ def _fuse_deltas(
     if deltas is None:
         if key in sd:
             return {}
-        fused = _copy_weight_without_lora(weight, key, target_dtype, device, is_scaled_fp8, scale_key, model_sd)
-    elif weight.dtype == torch.float8_e4m3fn:
+        return _copy_weight_without_lora(weight, key, target_dtype, device, is_scaled_fp8, scale_key, model_sd)
+
+    if tuple(deltas.shape) != tuple(weight.shape):
+        raise ValueError(
+            f"LoRA delta shape mismatch for key={key}: weight_shape={tuple(weight.shape)} deltas_shape={tuple(deltas.shape)}"
+        )
+
+    if weight.dtype == torch.float8_e4m3fn:
         if is_scaled_fp8:
-            fused = _fuse_delta_with_scaled_fp8(deltas, weight, key, scale_key, model_sd)
+            fused = _fuse_delta_with_scaled_fp8(deltas, weight, key, scale_key, model_sd, target_dtype)
         else:
             fused = _fuse_delta_with_cast_fp8(deltas, weight, key, target_dtype, device)
     elif weight.dtype == torch.bfloat16:
@@ -112,16 +118,26 @@ def _fuse_delta_with_scaled_fp8(
     key: str,
     scale_key: str,
     model_sd: StateDict,
+    target_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
-    """Dequantize scaled FP8 weight, add LoRA delta, and re-quantize."""
+    """
+    Fuse LoRA delta with scaled FP8 weight.
+
+    If target_dtype is FP8, dequantize -> add -> re-quantize (keep scale key).
+    If target_dtype is not FP8 (e.g. bf16), dequantize -> add -> return in target_dtype (drop scale key).
+    """
     weight_scale = model_sd.sd[scale_key]
 
-    original_weight = weight.t().to(torch.float32) * weight_scale
+    # Keep the checkpoint layout: the LoRA delta is computed in the same layout
+    # as the stored weight. Transposing here breaks rectangular projections.
+    original_weight = weight.to(torch.float32) * weight_scale
 
     new_weight = original_weight + deltas.to(torch.float32)
 
-    new_fp8_weight, new_weight_scale = quantize_weight_to_fp8_per_tensor(new_weight)
-    return {key: new_fp8_weight, scale_key: new_weight_scale}
+    if target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        new_fp8_weight, new_weight_scale = quantize_weight_to_fp8_per_tensor(new_weight)
+        return {key: new_fp8_weight, scale_key: new_weight_scale}
+    return {key: new_weight.to(dtype=target_dtype)}
 
 
 def _fuse_delta_with_cast_fp8(
